@@ -7,20 +7,18 @@
 ```text
 應用程式 → sw::Aligner → backend 實作
                           ├─ striped/backend.cpp → kernel.cpp → detail/（依賴 libsimdpp）
-                          ├─ scalar/backend.cpp  （待填）
+                          ├─ scalar/backend.cpp  （naive Gotoh）
                           └─ cuda/backend.cpp    （待填）
 ```
 
-## 實作 scalar
+## Scalar
 
-1. 在 `src/backends/scalar/` 實作繼承 `sw::Aligner` 的私有類別。
-2. 實作 `align(SequenceView, SequenceView)` 與 `backend()`，沿用共同 global 契約。
-3. 替換該目錄 `backend.cpp` 的 unavailable/factory 入口；可用時 reason 回傳空字串。
-4. 需要新 source 時明確加入 CMake，不使用遞迴 glob。
-5. 讓實作通過 `tests/support/global_oracle.hpp` 分數比較與完整 CIGAR 重播。
-
-不要直接移回舊 scalar：備份的實作是 overlap 語意，與目前 global 契約不同。
-測試用 oracle 只供驗證，不作為 production scalar backend。
+`src/backends/scalar/backend.cpp` 是 naive Gotoh global affine-gap DP（逐 cell、int32），
+作為多執行緒 baseline。`align` 存一個 byte/cell 的 trace；`score` 只用 rolling row。
+同分時 S 的來源優先序為 diagonal > insertion > deletion，與 striped backtrace 相同；
+gap 同分時優先 open。要求 `gap_open <= gap_extend <= 0`，確保 CIGAR 合併相鄰 gap 後重播仍等於 DP 分數。
+每個 backend 都要實作 `align` 與 `score`，並通過 `tests/support/check_alignment.hpp`
+（oracle 分數、CIGAR 重播、score-only 一致）。
 
 ## 實作 CUDA
 
@@ -33,6 +31,7 @@
 5. `sw/base.hpp` 的 `Base`、`EncodedSequenceView` 與編碼 helper 可用於 device。
    view 只是一個 pointer/size，並不傳輸資料；host pointer 不可直接当 device pointer 使用。
 6. 對同一 global oracle 與 CIGAR 契約驗證，無 GPU 的 runtime 測試明確 skip。
+7. Batch/benchmark 路徑實作 `detail::make_cuda_batch`，契約見 [benchmark.md](benchmark.md)。
 
 ## Striped 的界線
 
@@ -41,5 +40,4 @@
 `detail/global_alignment.hpp` 與 `detail/simd_core.hpp` 是本專案自有演算法核心，
 直接使用 `sw::SequenceView` 與 `sw::Cigar`，不需要舊 Biovoltron 型別轉接。
 核心存在非 inline 函式，因此只允許 `kernel.cpp` 引入其標頭。
-`SOURCE.txt` 保留搬入前的歷史來源 revision，後續可直接在此維護演算法。
 第三方相依只有 `third_party/libsimdpp`。
