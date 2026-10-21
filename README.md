@@ -1,6 +1,6 @@
 # High-Performance Smith-Waterman Alignment
 
-[![CI](https://github.com/Mistbornk/High-Performance-Smith-Waterman-Alignment/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/Mistbornk/High-Performance-Smith-Waterman-Alignment/actions/workflows/ci.yml)
+[![CI](https://github.com/Mistbornk/High-Performance-Smith-Waterman-Alignment/actions/workflows/ci.yml/badge.svg?event=pull_request)](https://github.com/Mistbornk/High-Performance-Smith-Waterman-Alignment/actions/workflows/ci.yml)
 
 ## Environment
 
