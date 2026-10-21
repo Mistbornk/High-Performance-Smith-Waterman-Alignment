@@ -30,9 +30,15 @@ class Aligner {
   virtual ~Aligner() = default;
   virtual Backend backend() const noexcept = 0;
   virtual AlignmentResult align(SequenceView reference, SequenceView query) = 0;
+  // Score-only: same optimal score as align(), without traceback work or memory.
+  virtual std::int32_t score(SequenceView reference, SequenceView query) = 0;
   AlignmentResult align(std::string_view reference, std::string_view query) {
     const auto ref = encode_sequence(reference), que = encode_sequence(query);
     return align(SequenceView(ref), SequenceView(que));
+  }
+  std::int32_t score(std::string_view reference, std::string_view query) {
+    const auto ref = encode_sequence(reference), que = encode_sequence(query);
+    return score(SequenceView(ref), SequenceView(que));
   }
 };
 // Throws runtime_error for unavailable backends. Never silently falls back.

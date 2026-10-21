@@ -5,7 +5,7 @@
 
 `libsimdpp/include/simdpp/` 由原套件的
 `lib/Biovoltron/submodules/libsimdpp/simdpp/` 搬入，內容保持原樣。
-完整舊套件與原始校驗清單保留在 `backup/` 快照中。
+完整舊套件與原始校驗清單已打包於 repo 外（`~/backups/sw-alignment-backup-original-20261007.tar.gz`）。
 
 Striped 是本專案作者的自有實作，位於 `src/backends/striped/detail/`，
 不屬於第三方程式碼。共用 base helper 的 Biovoltron MIT 聲明

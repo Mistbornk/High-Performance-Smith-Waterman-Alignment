@@ -15,10 +15,9 @@ int main() {
     for (const auto bad : {"0M", "1X", "M", "1", "1M0", "1M2"})
       expect_throw<std::invalid_argument>([&] { sw::Cigar cigar(bad); });
     expect_throw<std::length_error>([] { sw::Cigar cigar("4294967296M"); });
-    for (auto backend : {sw::Backend::scalar, sw::Backend::cuda}) {
-      CHECK(*sw::unavailable_reason(backend));
-      expect_throw<std::runtime_error>([&] { sw::make_aligner(backend); });
-    }
+    CHECK(!*sw::unavailable_reason(sw::Backend::scalar));
+    CHECK(*sw::unavailable_reason(sw::Backend::cuda));
+    expect_throw<std::runtime_error>([] { sw::make_aligner(sw::Backend::cuda); });
     const auto unknown = static_cast<sw::Backend>(999);
     CHECK(std::string(sw::backend_name(unknown)) == "unknown");
     expect_throw<std::runtime_error>([&] { sw::make_aligner(unknown); });

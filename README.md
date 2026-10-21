@@ -20,11 +20,23 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 2
 ```
 
-The default build produces the `sw` library, the `sw-align` example, and tests.
+The default build produces the `sw` library, the `sw-align` example, the
+`sw-bench` benchmark driver, and tests.
 
 Optional CMake flags:
 
 - `-DSW_BUILD_EXAMPLES=OFF`: disable the command-line example.
+- `-DSW_BUILD_BENCHMARKS=OFF`: disable `sw-bench`.
 - `-DBUILD_TESTING=OFF`: disable tests.
-- `-DSW_ENABLE_STRIPED=OFF`: build only the API skeleton on platforms without
-  the striped backend; scalar and CUDA backends are not implemented.
+- `-DSW_ENABLE_STRIPED=OFF`: build without the striped backend on platforms without
+  SSE4.1; the scalar backend is still available. CUDA is not implemented yet.
+
+## Benchmark
+
+```sh
+python3 scripts/gen_dataset.py --out data/len512 --pairs 2000 --length 512
+python3 scripts/run_benchmarks.py --bench build/sw-bench --dataset data/len512 \
+  --threads 1,4,16 --out results/run1
+```
+
+See [docs/benchmark.md](docs/benchmark.md) for the IO, batch API and timing contract.

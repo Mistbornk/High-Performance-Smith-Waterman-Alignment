@@ -24,6 +24,15 @@ class StripedAligner final : public Aligner {
       : scoring_(scoring), trace_(create_trace(), destroy_trace) {}
   Backend backend() const noexcept override { return Backend::striped; }
   AlignmentResult align(SequenceView ref, SequenceView query) override {
+    validate(ref, query);
+    return execute(ref, query, scoring_, *trace_);
+  }
+  std::int32_t score(SequenceView ref, SequenceView query) override {
+    validate(ref, query);
+    return execute_score(ref, query, scoring_);
+  }
+ private:
+  void validate(SequenceView ref, SequenceView query) const {
     for (auto sequence : {ref, query})
       for (Base base : sequence)
         if (base < 0 || base > 4) throw std::invalid_argument("Encoded DNA must contain 0..4");
@@ -33,9 +42,7 @@ class StripedAligner final : public Aligner {
     const auto limit = static_cast<std::size_t>(INT32_MAX / (4 * magnitude));
     if (ref.size() > limit || query.size() > limit - ref.size())
       throw std::length_error("Alignment exceeds striped index/score range");
-    return execute(ref, query, p, *trace_);
   }
- private:
   Scoring scoring_;
   std::unique_ptr<StripedTrace, void(*)(StripedTrace*)> trace_;
 };
