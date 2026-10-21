@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: ${{ matrix.compiler }} ${{ matrix.build_type }}${{ matrix.striped == 'OFF' && ' (no striped)' || '' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Release, Debug]
+        striped: ['ON']
+        include:
+          # API, IO and scalar must keep working on platforms without SSE4.1.
+          - compiler: gcc
+            build_type: Release
+            striped: 'OFF'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = clang ]; then
+            echo "CC=clang" >> "$GITHUB_ENV"; echo "CXX=clang++" >> "$GITHUB_ENV"
+          else
+            echo "CC=gcc" >> "$GITHUB_ENV"; echo "CXX=g++" >> "$GITHUB_ENV"
+          fi
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DSW_ENABLE_STRIPED=${{ matrix.striped }} -DCMAKE_CXX_FLAGS="-Wall -Wextra"
+      - name: Build
+        run: cmake --build build --parallel "$(nproc)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+  sanitizers:
+    name: ${{ matrix.sanitizer }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: address+undefined
+            flags: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+          - sanitizer: thread
+            flags: -fsanitize=thread
+    steps:
+      - uses: actions/checkout@v4
+      - name: Allow TSan memory layout
+        if: matrix.sanitizer == 'thread'
+        # Newer runner kernels randomize mmap beyond what TSan supports.
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_FLAGS="${{ matrix.flags }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.flags }}"
+      - name: Build
+        run: cmake --build build --parallel "$(nproc)"
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1
+        # The Python flow test exercises sw-bench timing, not memory safety.
+        run: ctest --test-dir build --output-on-failure --no-tests=error -E bench_flow
+
+  benchmark-smoke:
+    name: benchmark smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build --parallel "$(nproc)" --target sw-bench
+      - name: Generate dataset
+        run: python3 scripts/gen_dataset.py --out data/smoke --pairs 200 --length 128 --max-length 512
+      - name: Run sweep
+        run: |
+          for mode in traceback score-only; do
+            extra=""; [ "$mode" = score-only ] && extra="--score-only"
+            python3 scripts/run_benchmarks.py --bench build/sw-bench --dataset data/smoke \
+              --backends striped,scalar,cuda --threads 1,2 --warmup 0 --repetitions 2 \
+              --out "results/$mode" $extra
+          done
+      - name: Summary
+        if: always()
+        run: |
+          for f in results/*/results.csv; do
+            echo "### $f" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cut -d, -f3,4,5,14,16,18 "$f" | column -s, -t >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-smoke
+          path: results/
