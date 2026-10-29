@@ -90,6 +90,12 @@ class BenchFlow(unittest.TestCase):
                 sums.add(row["score_checksum"])
                 if extra:
                     self.assertTrue(all(line.endswith("\t*") for line in tsv.read_text().splitlines()[1:]))
+        # cuda is score-only; it joins the comparison when built and a GPU is present.
+        cuda = run(BENCH, "--reference", self.data / "reference.fa", "--query", self.data / "query.fa",
+                   "--backend", "cuda", "--repetitions", "1", "--score-only", check=False)
+        if cuda.returncode != 77:
+            self.assertEqual(cuda.returncode, 0, cuda.stderr)
+            sums.add(next(csv.DictReader(cuda.stdout.splitlines()))["score_checksum"])
         self.assertEqual(len(sums), 1)
 
     def test_driver(self):

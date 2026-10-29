@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -19,9 +20,12 @@
 #else
 #define SW_HOST_DEVICE
 #endif
-// Defined to 1 by CMake when the SSE4.1 striped backend is built.
+// Defined to 1 by CMake when the SSE4.1 striped / CUDA backends are built.
 #ifndef SW_HAVE_STRIPED
 #define SW_HAVE_STRIPED 0
+#endif
+#ifndef SW_HAVE_CUDA
+#define SW_HAVE_CUDA 0
 #endif
 
 namespace sw {
@@ -124,6 +128,31 @@ namespace striped {
 std::int32_t score(SequenceView reference, SequenceView query, Scoring scoring = {});
 Alignment align(SequenceView reference, SequenceView query, Scoring scoring = {});
 } // namespace striped
+#endif
+
+class Workload;  // sw/io.hpp
+
+#if SW_HAVE_CUDA
+// One warp per pair on the GPU; score-only.
+namespace cuda {
+// Empty when a device can run the kernels, otherwise the reason it cannot.
+const char* unavailable_reason() noexcept;
+// Device copy of a workload: the constructor uploads it, score() can then run many
+// times. Throws runtime_error when no usable device is present.
+class Batch {
+ public:
+  explicit Batch(const Workload& workload);
+  ~Batch();
+  Batch(const Batch&) = delete;
+  Batch& operator=(const Batch&) = delete;
+  // Synchronous; out[i] is the global alignment score of workload task i.
+  void score(Scoring scoring, std::vector<std::int32_t>& out);
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+} // namespace cuda
 #endif
 
 // Calls body(i) for every i in [0, n) on up to `threads` threads (the caller is one

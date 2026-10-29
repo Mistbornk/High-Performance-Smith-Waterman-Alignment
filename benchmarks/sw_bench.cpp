@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -139,7 +140,7 @@ void write_results(const std::string& path, const sw::Workload& workload,
   }
   if (!out) throw std::runtime_error("failed writing " + path);
 }
-// The backend's align/score pair. Unbuilt backends return false (exit 77).
+// The CPU backend's align/score pair; false for cuda and unbuilt backends.
 struct Functions {
   std::int32_t (*score)(sw::SequenceView, sw::SequenceView, sw::Scoring);
   sw::Alignment (*align)(sw::SequenceView, sw::SequenceView, sw::Scoring);
@@ -159,9 +160,23 @@ bool lookup(Backend backend, Functions& out) {
 int main(int argc, char** argv) {
   try {
     const auto args = parse(argc, argv);
-    Functions run;
-    if (!lookup(args.backend, run)) {
-      std::cerr << "sw-bench: " << backend_name(args.backend) << " unavailable: not built\n";
+    Functions run{};
+    const bool device = args.backend == Backend::cuda;
+    const char* unavailable = nullptr;
+    if (device) {
+#if SW_HAVE_CUDA
+      if (const auto reason = sw::cuda::unavailable_reason(); *reason) unavailable = reason;
+      // Skip rather than fail, so traceback sweeps over all backends still run.
+      else if (args.traceback) unavailable = "score-only backend, pass --score-only";
+      else if (args.threads != 1) throw std::invalid_argument("cuda runs with --threads 1");
+#else
+      unavailable = "not built (configure with -DSW_ENABLE_CUDA=ON)";
+#endif
+    } else if (!lookup(args.backend, run)) {
+      unavailable = "not built";
+    }
+    if (unavailable) {
+      std::cerr << "sw-bench: " << backend_name(args.backend) << " unavailable: " << unavailable << '\n';
       return skip_code;
     }
 
@@ -169,11 +184,24 @@ int main(int argc, char** argv) {
     sw::Workload workload(sw::io::read_sequences(args.reference, args.read),
                           sw::io::read_sequences(args.query, args.read), args.pairing);
     const auto load_s = seconds_since(start);
-    // CPU backends have nothing to set up; device backends will time uploads here.
-    const double setup_s = 0;
+    // CPU backends have nothing to set up; cuda uploads the workload here.
+    start = std::chrono::steady_clock::now();
+#if SW_HAVE_CUDA
+    std::unique_ptr<sw::cuda::Batch> batch;
+    if (device) batch = std::make_unique<sw::cuda::Batch>(workload);
+#endif
+    const auto setup_s = seconds_since(start);
 
     std::vector<sw::Alignment> results(workload.size());
+    std::vector<std::int32_t> scores;
     auto align_all = [&] {
+#if SW_HAVE_CUDA
+      if (device) {
+        batch->score(args.scoring, scores);
+        for (std::size_t i = 0; i < scores.size(); ++i) results[i].score = scores[i];
+        return;
+      }
+#endif
       sw::parallel_for(workload.size(), args.threads, [&](std::size_t i) {
         const auto ref = workload.reference(i), query = workload.query(i);
         if (args.traceback) results[i] = run.align(ref, query, args.scoring);

@@ -10,7 +10,8 @@ gen_dataset.py ──> reference.fa / query.fa / meta.json
                          │
                 sw::Workload（zip | all_vs_all，task 即時計算、不展開）
                          │
-sw-bench ── striped / scalar：sw::parallel_for 對每個 task 呼叫 <backend>::align 或 ::score
+sw-bench ─┬─ striped / scalar：sw::parallel_for 對每個 task 呼叫 <backend>::align 或 ::score
+          └─ cuda：sw::cuda::Batch(workload) 上傳一次，之後每次 batch.score(scoring, scores)
                          │
                 一列 CSV ──> run_benchmarks.py 匯整 results.csv + metadata.json
 ```
@@ -83,6 +84,17 @@ python3 scripts/run_benchmarks.py --bench build/sw-bench \
   與 `logs/`。exit 77 記為 skipped；同一 dataset 各 backend 的 `score_checksum`
   不一致時列為 `score_mismatches` 並以非 0 結束。
 
+## CUDA（`src/cuda.cu`）
+
+- 由舊版 Biovoltron `SmithWatermanCuda` 的 kernel 移植：一個 warp 算一對，query 切成 32 欄的
+  stripe、每個 lane 一欄，沿 anti-diagonal 推進；H 與水平 gap F 用 `__shfl_up_sync` 往右傳，
+  stripe 的最後一欄存到 global 給下一個 stripe 當左邊界。
+- 與 scalar 同一套 global DP（邊界 gap(j)、答案取 H(N,M)），只算分數。
+- `Batch` 建構時上傳 `SequenceSet::data()/offsets()`（`setup_s`）；`score()` 同步回傳。
+  邊界 scratch 依 warp slot 配置（256 MB 預算內盡量多開 warp），task 用 grid-stride 分配。
+- sw-bench：沒有 `--score-only` 時回傳 77（skip），`--threads` 必須是 1。
+- 建置：`-DSW_ENABLE_CUDA=ON`，預設 `CMAKE_CUDA_ARCHITECTURES=86`。
+
 ## 公平比較
 
 GPU kernel 通常只算分數；CPU 端要用 `--score-only` 對比，CSV 的 `traceback` 欄位用來避免混比。
@@ -93,7 +105,7 @@ GPU kernel 通常只算分數；CPU 端要用 `--score-only` 對比，CSV 的 `t
 | --- | --- | --- | --- | --- |
 | striped | SSE4.1 striped，8-bit 差值 | ✓ | ✓ | byte 差值範圍（見 `src/striped.cpp` 的 `validate`） |
 | scalar | naive Gotoh，逐 cell、32-bit | ✓ | ✓ | `gap_open <= gap_extend <= 0`、int32 範圍 |
-| cuda | 待移植 | | | |
+| cuda | warp-per-pair wavefront，32-bit | | ✓ | `gap_open <= gap_extend <= 0`、int32 範圍 |
 
 ## 多執行緒注意事項
 

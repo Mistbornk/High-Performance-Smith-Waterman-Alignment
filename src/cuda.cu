@@ -1,0 +1,221 @@
+#include <sw/io.hpp>
+#include <cuda_runtime.h>
+#include <algorithm>
+#include <climits>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+// Ported from the earlier Biovoltron SmithWatermanCuda kernel, changed to global
+// alignment and score-only: no trace matrix, no gap-length tracking, no sink search.
+namespace sw::cuda {
+namespace {
+constexpr int warp_size = 32;
+constexpr int warps_per_block = 8;
+constexpr unsigned full_mask = 0xffffffffu;
+constexpr int neg_inf = INT_MIN / 2;
+
+void check(cudaError_t e, const char* what) {
+  if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+}
+
+// Owning device array. resize() discards contents and only grows the allocation.
+template <class T> class DeviceBuffer {
+ public:
+  DeviceBuffer() = default;
+  DeviceBuffer(const DeviceBuffer&) = delete;
+  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+  ~DeviceBuffer() { cudaFree(data_); }
+  void resize(std::size_t n) {
+    if (n > capacity_) {
+      cudaFree(data_);
+      data_ = nullptr, capacity_ = 0;
+      check(cudaMalloc(&data_, n * sizeof(T)), "cudaMalloc");
+      capacity_ = n;
+    }
+  }
+  void upload(const T* host, std::size_t n) {
+    resize(n);
+    if (n) check(cudaMemcpy(data_, host, n * sizeof(T), cudaMemcpyHostToDevice), "cudaMemcpy H2D");
+  }
+  T* data() const noexcept { return data_; }
+
+ private:
+  T* data_ = nullptr;
+  std::size_t capacity_ = 0;
+};
+
+struct DeviceSet {
+  const Base* data;
+  const std::size_t* offsets;
+};
+
+__device__ __forceinline__ int gap(int k, Scoring p) {
+  return k ? p.gap_open + (k - 1) * p.gap_extend : 0;
+}
+
+// One warp scores one pair: reference rows 1..n, query columns 1..m. The query is cut
+// into 32-column stripes with one column per lane. Inside a stripe the lanes sweep
+// anti-diagonals (lane l handles row d - l - 1 at step d); H and the horizontal gap F
+// move right through shuffles. The stripe's last column is stored in temp_h/temp_f
+// (one entry per reference row) and becomes the next stripe's left edge.
+//
+//   E(i,j) = max(H(i-1,j) + open, E(i-1,j) + extend)   vertical, from h_top
+//   F(i,j) = max(H(i,j-1) + open, F(i,j-1) + extend)   horizontal, from h_left
+//   H(i,j) = max(H(i-1,j-1) + sub, E(i,j), F(i,j))
+// with H(i,0) = gap(i), H(0,j) = gap(j), E(0,j) = F(i,0) = -inf: the same DP as
+// sw::scalar, so scores match it exactly.
+__device__ int warp_score(const Base* __restrict__ ref, const Base* __restrict__ query, int n, int m,
+                          Scoring p, int* __restrict__ temp_h, int* __restrict__ temp_f) {
+  const int lane = threadIdx.x & (warp_size - 1);
+  // The first stripe's left edge is column 0.
+  for (int row = lane; row < n; row += warp_size) temp_h[row] = gap(row + 1, p), temp_f[row] = neg_inf;
+  __syncwarp();
+
+  int result = 0;
+  for (int block = 0; block < m; block += warp_size) {
+    const int width = min(warp_size, m - block);
+    const int col = block + lane + 1;
+    const int q = col <= m ? query[col - 1] : -1;
+    // Row 0 of this column; the first diagonal predecessor is H(0, col-1).
+    int h_top = gap(col, p), h_diag = gap(col - 1, p), e_top = neg_inf;
+    int h_left = 0, f_left = neg_inf, r = 0;  // Lane 0 takes these from the cache.
+    int h_val = 0, f_val = neg_inf;
+    int cache_h = 0, cache_f = neg_inf, cache_r = 0;
+
+    for (int base = 2; base <= width + n; base += warp_size) {
+      // Every 32 steps each lane prefetches one left-edge row; the values then shift
+      // down one lane per step, so lane 0 always holds the row it needs next.
+      const int row = base - 2 + lane;
+      if (row < n) cache_h = temp_h[row], cache_f = temp_f[row], cache_r = ref[row];
+      else cache_h = 0, cache_f = neg_inf, cache_r = 0;
+
+      for (int d = base; d < base + warp_size; ++d) {
+        const int i = d - lane - 1;  // Reference row of this lane at step d.
+        if (lane < width && i >= 1 && i <= n) {
+          if (lane == 0) r = cache_r, h_left = cache_h, f_left = cache_f;
+          const int e = max(h_top + p.gap_open, e_top + p.gap_extend);
+          f_val = max(h_left + p.gap_open, f_left + p.gap_extend);
+          h_val = max(max(h_diag + (r == q ? p.match : p.mismatch), e), f_val);
+          if (lane == warp_size - 1) temp_h[i - 1] = h_val, temp_f[i - 1] = f_val;
+          if (col == m && i == n) result = h_val;
+          h_diag = h_left;
+          h_top = h_val;
+          e_top = e;
+        }
+        r = __shfl_up_sync(full_mask, r, 1);
+        h_left = __shfl_up_sync(full_mask, h_val, 1);
+        f_left = __shfl_up_sync(full_mask, f_val, 1);
+        cache_h = __shfl_down_sync(full_mask, cache_h, 1);
+        cache_f = __shfl_down_sync(full_mask, cache_f, 1);
+        cache_r = __shfl_down_sync(full_mask, cache_r, 1);
+      }
+    }
+    __syncwarp();  // The next stripe reads the edge lane 31 just wrote.
+  }
+  return __shfl_sync(full_mask, result, (m - 1) % warp_size);
+}
+
+// Grid-stride over tasks, one warp per task; each warp slot owns 2 * temp_rows ints
+// of edge scratch, reused for every task it processes.
+__global__ void score_kernel(DeviceSet refs, DeviceSet queries, std::size_t tasks,
+                             std::size_t reference_count, bool zip, Scoring p,
+                             int* temp, std::size_t temp_rows, int* scores) {
+  const std::size_t thread = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x;
+  const std::size_t warp = thread / warp_size;
+  const std::size_t warps = gridDim.x * std::size_t(blockDim.x) / warp_size;
+  int* temp_h = temp + warp * 2 * temp_rows;
+  int* temp_f = temp_h + temp_rows;
+  for (std::size_t t = warp; t < tasks; t += warps) {
+    // Same mapping as Workload::task().
+    const std::size_t r = zip ? t : t % reference_count, q = zip ? t : t / reference_count;
+    const int n = int(refs.offsets[r + 1] - refs.offsets[r]);
+    const int m = int(queries.offsets[q + 1] - queries.offsets[q]);
+    const int s = !n || !m ? gap(n + m, p)
+                           : warp_score(refs.data + refs.offsets[r], queries.data + queries.offsets[q],
+                                        n, m, p, temp_h, temp_f);
+    if ((threadIdx.x & (warp_size - 1)) == 0) scores[t] = s;
+  }
+}
+
+__global__ void probe_kernel(int* out) { *out = encode_base('G') + 10 * complement_base(encode_base('A')); }
+} // namespace
+
+const char* unavailable_reason() noexcept {
+  // Probing creates a CUDA context, so do it once per process.
+  static const char* const reason = []() -> const char* {
+    int count = 0;
+    if (const auto e = cudaGetDeviceCount(&count); e != cudaSuccess) return cudaGetErrorString(e);
+    if (count == 0) return "no CUDA device available";
+    int* device = nullptr;
+    int host = -1;
+    if (const auto e = cudaMalloc(&device, sizeof(int)); e != cudaSuccess) return cudaGetErrorString(e);
+    probe_kernel<<<1, 1>>>(device);
+    auto e = cudaGetLastError();  // e.g. no kernel image for this GPU's architecture
+    if (e == cudaSuccess) e = cudaMemcpy(&host, device, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(device);
+    if (e != cudaSuccess) return cudaGetErrorString(e);
+    return host == 2 + 10 * 3 ? "" : "CUDA probe kernel returned a wrong value";
+  }();
+  return reason;
+}
+
+struct Batch::Impl {
+  DeviceBuffer<Base> ref_data, query_data;
+  DeviceBuffer<std::size_t> ref_offsets, query_offsets;
+  DeviceBuffer<int> temp, scores;
+  std::size_t tasks = 0, reference_count = 0, max_ref = 0, max_query = 0;
+  bool zip = true;
+};
+
+Batch::Batch(const Workload& workload) : impl_(new Impl) {
+  if (const auto reason = unavailable_reason(); *reason) throw std::runtime_error(reason);
+  auto& d = *impl_;
+  const auto& refs = workload.references();
+  const auto& queries = workload.queries();
+  for (const auto* set : {&refs, &queries})
+    for (std::size_t i = 0; i < set->total_bases(); ++i)
+      if (set->data()[i] < 0 || set->data()[i] > 4) throw std::invalid_argument("Encoded DNA must contain 0..4");
+  d.tasks = workload.size();
+  d.reference_count = refs.size();
+  d.max_ref = refs.max_length();
+  d.max_query = queries.max_length();
+  d.zip = workload.pairing() == Pairing::zip;
+  d.ref_data.upload(refs.data(), refs.total_bases());
+  d.ref_offsets.upload(refs.offsets().data(), refs.offsets().size());
+  d.query_data.upload(queries.data(), queries.total_bases());
+  d.query_offsets.upload(queries.offsets().data(), queries.offsets().size());
+  d.scores.resize(d.tasks);
+}
+
+Batch::~Batch() = default;
+
+void Batch::score(Scoring p, std::vector<std::int32_t>& out) {
+  auto& d = *impl_;
+  if (p.gap_extend > 0 || p.gap_open > p.gap_extend)
+    throw std::invalid_argument("Requires gap_open<=gap_extend<=0");
+  // Same int32 headroom rule as sw::scalar, applied to the longest pair.
+  const std::int64_t magnitude = std::max({std::int64_t(p.match), -std::int64_t(p.mismatch),
+      -std::int64_t(p.gap_open), -std::int64_t(p.gap_extend), std::int64_t(1)});
+  const auto limit = static_cast<std::size_t>(INT32_MAX / (4 * magnitude));
+  if (d.max_ref > limit || d.max_query > limit - d.max_ref)
+    throw std::length_error("Alignment exceeds cuda score range");
+  out.resize(d.tasks);
+  if (!d.tasks) return;
+
+  // As many concurrent warps as the edge-scratch budget allows.
+  constexpr std::size_t budget = std::size_t(256) << 20;
+  const std::size_t rows = std::max<std::size_t>(1, d.max_ref);
+  const auto fit = std::max<std::size_t>(1, budget / (2 * rows * sizeof(int)));
+  const auto blocks = (std::min(d.tasks, fit) + warps_per_block - 1) / warps_per_block;
+  d.temp.resize(blocks * warps_per_block * 2 * rows);
+
+  score_kernel<<<unsigned(blocks), warps_per_block * warp_size>>>(
+      {d.ref_data.data(), d.ref_offsets.data()}, {d.query_data.data(), d.query_offsets.data()},
+      d.tasks, d.reference_count, d.zip, p, d.temp.data(), rows, d.scores.data());
+  check(cudaGetLastError(), "score_kernel launch");
+  check(cudaMemcpy(out.data(), d.scores.data(), d.tasks * sizeof(int), cudaMemcpyDeviceToHost),
+        "score_kernel");
+}
+} // namespace sw::cuda

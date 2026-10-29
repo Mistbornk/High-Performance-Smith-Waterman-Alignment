@@ -11,7 +11,7 @@
 
 The public API requires C++17. The striped kernel requires C++20.
 The libsimdpp headers are included in `third_party/`; no separate installation
-is required. The current build does not require the CUDA toolkit.
+is required. The CUDA toolkit is only needed with `-DSW_ENABLE_CUDA=ON`.
 
 ## Build
 
@@ -31,7 +31,9 @@ Optional CMake flags:
 - `-DSW_BUILD_BENCHMARKS=OFF`: disable `sw-bench`.
 - `-DBUILD_TESTING=OFF`: disable tests.
 - `-DSW_ENABLE_STRIPED=OFF`: build without the striped backend on platforms without
-  SSE4.1; the scalar backend is still available. CUDA is not implemented yet.
+  SSE4.1; the scalar backend is still available.
+- `-DSW_ENABLE_CUDA=ON`: build the score-only CUDA backend (CUDA toolkit 12; defaults to
+  `CMAKE_CUDA_ARCHITECTURES=86`, override for other GPUs).
 
 ## Layout
 
@@ -42,6 +44,7 @@ src/io.cpp             IO and Workload
 src/scalar.cpp         sw::scalar::align / score   (naive Gotoh; the reference)
 src/striped.cpp        sw::striped::align / score  (SSE4.1; only file built with C++20/libsimdpp)
 src/striped/           striped SIMD kernel internals
+src/cuda.cu            sw::cuda::Batch             (one warp per pair; score-only)
 benchmarks/sw_bench.cpp  timing driver (one CSV row per run)
 tests/                 align_test (all backends vs. an oracle), io_test, bench_flow_test.py
 ```
