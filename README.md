@@ -33,6 +33,30 @@ Optional CMake flags:
 - `-DSW_ENABLE_STRIPED=OFF`: build without the striped backend on platforms without
   SSE4.1; the scalar backend is still available. CUDA is not implemented yet.
 
+## Layout
+
+```text
+include/sw/sw.hpp      encoding, Cigar, Scoring, Alignment, per-backend functions, parallel_for
+include/sw/io.hpp      FASTA/FASTQ -> SequenceSet, Workload (zip | all_vs_all)
+src/io.cpp             IO and Workload
+src/scalar.cpp         sw::scalar::align / score   (naive Gotoh; the reference)
+src/striped.cpp        sw::striped::align / score  (SSE4.1; only file built with C++20/libsimdpp)
+src/striped/           striped SIMD kernel internals
+benchmarks/sw_bench.cpp  timing driver (one CSV row per run)
+tests/                 align_test (all backends vs. an oracle), io_test, bench_flow_test.py
+```
+
+Every backend is a pair of free functions with the same signature:
+
+```cpp
+#include <sw/sw.hpp>
+auto ref = sw::encode_sequence("ACGT"), query = sw::encode_sequence("ACTGT");
+sw::Alignment a = sw::scalar::align(ref, query, {1, -4, -6, -1});  // score + CIGAR
+std::int32_t s = sw::scalar::score(ref, query);                     // score only
+```
+
+Adding a backend means one source file plus one `case` in `sw-bench`.
+
 ## Benchmark
 
 ```sh
@@ -41,4 +65,4 @@ python3 scripts/run_benchmarks.py --bench build/sw-bench --dataset data/len512 \
   --threads 1,4,16 --out results/run1
 ```
 
-See [docs/benchmark.md](docs/benchmark.md) for the IO, batch API and timing contract.
+See [docs/benchmark.md](docs/benchmark.md) for the IO and timing contract.

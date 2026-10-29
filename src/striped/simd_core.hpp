@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cassert>
-#include <sw/sequence.hpp>
+#include <sw/sw.hpp>
 #include <vector>
 #include <simdpp/simd.h>
 
