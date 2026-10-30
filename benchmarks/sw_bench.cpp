@@ -1,13 +1,14 @@
 // sw-bench: time one backend on one FASTA workload and print a single CSV row.
-// Loading, encoding and aligner construction are measured separately from the
-// timed align() calls; see docs/benchmark.md for the full measurement contract.
-#include <sw/batch.hpp>
+// Loading and encoding are measured separately from the timed runs; see
+// docs/benchmark.md for the full measurement contract.
+#include <sw/io.hpp>
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -15,12 +16,24 @@
 namespace {
 constexpr int skip_code = 77;  // CTest/driver convention: backend unavailable.
 
+enum class Backend { striped, scalar, cuda };
+const char* backend_name(Backend backend) {
+  switch (backend) {
+    case Backend::striped: return "striped";
+    case Backend::scalar: return "scalar";
+    case Backend::cuda: return "cuda";
+  }
+  return "unknown";
+}
+
 struct Args {
-  sw::Backend backend = sw::Backend::striped;
+  Backend backend = Backend::striped;
   std::string reference, query, results, label;
   sw::Pairing pairing = sw::Pairing::zip;
   sw::Scoring scoring;
-  sw::BatchOptions batch;
+  unsigned threads = 1;
+  unsigned regs = 0;
+  bool traceback = true;
   sw::io::ReadOptions read;
   unsigned warmup = 1, repetitions = 5;
   bool header = true;
@@ -30,6 +43,7 @@ const char* usage =
     "Usage: sw-bench --reference R.fa --query Q.fa [options]\n"
     "  --backend striped|scalar|cuda   (default striped)\n"
     "  --threads N                     CPU worker threads (default 1)\n"
+    "  --regs N                        cuda columns per lane: 1,2,4,8,16 (default: by query length)\n"
     "  --pairing zip|all_vs_all        (default zip)\n"
     "  --scoring M,X,O,E               match,mismatch,gap_open,gap_extend (default 1,-4,-6,-1)\n"
     "  --score-only                    request score-only results (no traceback)\n"
@@ -64,14 +78,14 @@ Args parse(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string key = argv[i];
     if (key == "--help") { std::cout << usage; std::exit(0); }
-    if (key == "--score-only") { args.batch.traceback = false; continue; }
+    if (key == "--score-only") { args.traceback = false; continue; }
     if (key == "--no-header") { args.header = false; continue; }
     if (i + 1 == argc) throw std::invalid_argument("missing value for " + key);
     const std::string value = argv[++i];
     if (key == "--backend") {
-      if (value == "striped") args.backend = sw::Backend::striped;
-      else if (value == "scalar") args.backend = sw::Backend::scalar;
-      else if (value == "cuda") args.backend = sw::Backend::cuda;
+      if (value == "striped") args.backend = Backend::striped;
+      else if (value == "scalar") args.backend = Backend::scalar;
+      else if (value == "cuda") args.backend = Backend::cuda;
       else throw std::invalid_argument("unknown backend " + value);
     } else if (key == "--pairing") {
       if (value == "zip") args.pairing = sw::Pairing::zip;
@@ -86,7 +100,8 @@ Args parse(int argc, char** argv) {
     else if (key == "--results") args.results = value;
     else if (key == "--label") args.label = value;
     else if (key == "--scoring") args.scoring = parse_scoring(value);
-    else if (key == "--threads") args.batch.threads = parse_unsigned(value, key);
+    else if (key == "--threads") args.threads = parse_unsigned(value, key);
+    else if (key == "--regs") args.regs = parse_unsigned(value, key);
     else if (key == "--warmup") args.warmup = parse_unsigned(value, key);
     else if (key == "--repetitions") args.repetitions = parse_unsigned(value, key);
     else throw std::invalid_argument("unknown option " + key);
@@ -94,6 +109,7 @@ Args parse(int argc, char** argv) {
   if (args.reference.empty() || args.query.empty())
     throw std::invalid_argument("--reference and --query are required");
   if (!args.repetitions) throw std::invalid_argument("--repetitions must be positive");
+  if (args.threads == 0 || args.threads > 1024) throw std::invalid_argument("--threads must be 1..1024");
   if (args.label.find_first_of(",\n\"") != std::string::npos)
     throw std::invalid_argument("--label must not contain commas, quotes or newlines");
   return args;
@@ -105,7 +121,7 @@ double seconds_since(std::chrono::steady_clock::time_point start) {
 
 // FNV-1a over scores in task order. Backends may pick different CIGARs on ties,
 // so only scores are compared across backends.
-std::uint64_t score_checksum(const std::vector<sw::AlignmentResult>& results) {
+std::uint64_t score_checksum(const std::vector<sw::Alignment>& results) {
   std::uint64_t hash = 1469598103934665603ull;
   for (const auto& result : results) {
     auto value = static_cast<std::uint32_t>(result.score);
@@ -115,7 +131,7 @@ std::uint64_t score_checksum(const std::vector<sw::AlignmentResult>& results) {
 }
 
 void write_results(const std::string& path, const sw::Workload& workload,
-                   const std::vector<sw::AlignmentResult>& results) {
+                   const std::vector<sw::Alignment>& results) {
   std::ofstream out(path);
   if (!out) throw std::runtime_error("cannot write " + path);
   out << "task\treference\tquery\tscore\tcigar\n";
@@ -127,13 +143,43 @@ void write_results(const std::string& path, const sw::Workload& workload,
   }
   if (!out) throw std::runtime_error("failed writing " + path);
 }
+// The CPU backend's align/score pair; false for cuda and unbuilt backends.
+struct Functions {
+  std::int32_t (*score)(sw::SequenceView, sw::SequenceView, sw::Scoring);
+  sw::Alignment (*align)(sw::SequenceView, sw::SequenceView, sw::Scoring);
+};
+bool lookup(Backend backend, Functions& out) {
+  switch (backend) {
+    case Backend::scalar: out = {sw::scalar::score, sw::scalar::align}; return true;
+#if SW_HAVE_STRIPED
+    case Backend::striped: out = {sw::striped::score, sw::striped::align}; return true;
+#endif
+    default: return false;
+  }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
   try {
     const auto args = parse(argc, argv);
-    if (const auto reason = sw::unavailable_reason(args.backend); *reason) {
-      std::cerr << "sw-bench: " << sw::backend_name(args.backend) << " unavailable: " << reason << '\n';
+    Functions run{};
+    const bool device = args.backend == Backend::cuda;
+    const char* unavailable = nullptr;
+    if (device) {
+#if SW_HAVE_CUDA
+      if (const auto reason = sw::cuda::unavailable_reason(); *reason) unavailable = reason;
+      // Skip rather than fail, so traceback sweeps over all backends still run.
+      else if (args.traceback) unavailable = "score-only backend, pass --score-only";
+      else if (args.threads != 1) throw std::invalid_argument("cuda runs with --threads 1");
+#else
+      unavailable = "not built (configure with -DSW_ENABLE_CUDA=ON)";
+#endif
+    } else if (!lookup(args.backend, run)) {
+      unavailable = "not built";
+    }
+    if (unavailable) {
+      std::cerr << "sw-bench: " << backend_name(args.backend) << " unavailable: " << unavailable << '\n';
       return skip_code;
     }
 
@@ -141,17 +187,35 @@ int main(int argc, char** argv) {
     sw::Workload workload(sw::io::read_sequences(args.reference, args.read),
                           sw::io::read_sequences(args.query, args.read), args.pairing);
     const auto load_s = seconds_since(start);
-
+    // CPU backends have nothing to set up; cuda uploads the workload here.
     start = std::chrono::steady_clock::now();
-    auto aligner = sw::make_batch_aligner(args.backend, args.scoring, args.batch);
+#if SW_HAVE_CUDA
+    std::unique_ptr<sw::cuda::Batch> batch;
+    if (device) batch = std::make_unique<sw::cuda::Batch>(workload);
+#endif
     const auto setup_s = seconds_since(start);
 
-    std::vector<sw::AlignmentResult> results;
-    for (unsigned i = 0; i < args.warmup; ++i) aligner->align(workload, results);
+    std::vector<sw::Alignment> results(workload.size());
+    std::vector<std::int32_t> scores;
+    auto align_all = [&] {
+#if SW_HAVE_CUDA
+      if (device) {
+        batch->score(args.scoring, scores, int(args.regs));
+        for (std::size_t i = 0; i < scores.size(); ++i) results[i].score = scores[i];
+        return;
+      }
+#endif
+      sw::parallel_for(workload.size(), args.threads, [&](std::size_t i) {
+        const auto ref = workload.reference(i), query = workload.query(i);
+        if (args.traceback) results[i] = run.align(ref, query, args.scoring);
+        else results[i].score = run.score(ref, query, args.scoring);
+      });
+    };
+    for (unsigned i = 0; i < args.warmup; ++i) align_all();
     std::vector<double> samples;
     for (unsigned i = 0; i < args.repetitions; ++i) {
       start = std::chrono::steady_clock::now();
-      aligner->align(workload, results);
+      align_all();
       samples.push_back(seconds_since(start));
     }
     if (!args.results.empty()) write_results(args.results, workload, results);
@@ -160,12 +224,11 @@ int main(int argc, char** argv) {
     const auto mid = samples.size() / 2;
     const double median = samples.size() % 2 ? samples[mid] : (samples[mid - 1] + samples[mid]) / 2;
     const auto gcups = [&](double s) { return s > 0 ? workload.cells() / s / 1e9 : 0.0; };
-    const auto options = aligner->options();
     if (args.header)
       std::cout << "label,backend,threads,traceback,pairing,references,queries,tasks,cells,"
                    "load_s,setup_s,min_s,median_s,max_s,gcups_median,gcups_best,score_checksum\n";
-    std::cout << args.label << ',' << sw::backend_name(aligner->backend()) << ',' << options.threads
-              << ',' << (options.traceback ? 1 : 0) << ',' << sw::pairing_name(workload.pairing())
+    std::cout << args.label << ',' << backend_name(args.backend) << ',' << args.threads
+              << ',' << (args.traceback ? 1 : 0) << ',' << sw::pairing_name(workload.pairing())
               << ',' << workload.references().size() << ',' << workload.queries().size() << ','
               << workload.size() << ',' << workload.cells() << ',' << load_s << ',' << setup_s << ','
               << samples.front() << ',' << median << ',' << samples.back() << ',' << gcups(median)

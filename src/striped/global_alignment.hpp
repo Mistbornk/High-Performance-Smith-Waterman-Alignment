@@ -1,7 +1,6 @@
 #pragma once
 
-#include <sw/sequence.hpp>
-#include <sw/cigar.hpp>
+#include <sw/sw.hpp>
 
 #include <tuple>
 #include <iomanip>
