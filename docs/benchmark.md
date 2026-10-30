@@ -86,10 +86,17 @@ python3 scripts/run_benchmarks.py --bench build/sw-bench \
 
 ## CUDA（`src/cuda.cu`）
 
-- 由舊版 Biovoltron `SmithWatermanCuda` 的 kernel 移植：一個 warp 算一對，query 切成 32 欄的
-  stripe、每個 lane 一欄，沿 anti-diagonal 推進；H 與水平 gap F 用 `__shfl_up_sync` 往右傳，
+- 由舊版 Biovoltron `SmithWatermanCuda` 的 kernel 移植：query 切成 `32 * R` 欄的 stripe、
+  每個 lane 負責 R 欄，沿 anti-diagonal 推進；垂直差 v 與水平 gap f 用 `__shfl_up_sync` 往右傳，
   stripe 的最後一欄存到 global 給下一個 stripe 當左邊界。
-- 與 scalar 同一套 global DP（邊界 gap(j)、答案取 H(N,M)），只算分數。
+- 與 scalar 同一套 global DP，但存的是相鄰格子的**差值**（difference recurrence，字母同 striped：
+  H、v、A、e、f），答案 = `gap(m) + Σ v(i,m)`，總和用 int32 累加。
+- **一個 warp 同時算兩對**：每個狀態是 `half2`，`.x` 是第一對、`.y` 是第二對，一條指令與一次
+  shuffle 同時推進兩對。差值有界（`3 * (max(match, mismatch, 0) - gap_open)`，與序列長度無關），
+  所以 half 的運算是精確的，不需要 overflow 偵測。
+- 配對：同一個長度 bucket 內依 `(m, n)` 由長到短排序，取相鄰兩個 task 為一組；較短的一對用不會
+  匹配的字元補齊，補齊的列／欄只影響它真實範圍右下方的格子，分數不受影響。奇數個 task 時最後一個
+  與自己配對。空序列的 task 不進 kernel（分數是一個 gap）。
 - `Batch` 建構時上傳 `SequenceSet::data()/offsets()`（`setup_s`）；`score()` 同步回傳。
   邊界 scratch 依 warp slot 配置（256 MB 預算內盡量多開 warp），task 用 grid-stride 分配。
 - sw-bench：沒有 `--score-only` 時回傳 77（skip），`--threads` 必須是 1。
@@ -105,7 +112,7 @@ GPU kernel 通常只算分數；CPU 端要用 `--score-only` 對比，CSV 的 `t
 | --- | --- | --- | --- | --- |
 | striped | SSE4.1 striped，8-bit 差值 | ✓ | ✓ | byte 差值範圍（見 `src/striped.cpp` 的 `validate`） |
 | scalar | naive Gotoh，逐 cell、32-bit | ✓ | ✓ | `gap_open <= gap_extend <= 0`、int32 範圍 |
-| cuda | warp-per-pair wavefront，32-bit | | ✓ | `gap_open <= gap_extend <= 0`、int32 範圍 |
+| cuda | warp 一次算兩對的 wavefront，差值遞迴、half2 | | ✓ | `gap_open <= gap_extend <= 0`、int32 範圍，且 `3 * (max(match, mismatch, 0) - gap_open) <= 2048`、`min(match, mismatch) >= -2048`、`|match - mismatch| <= 2048`（否則 `length_error`） |
 
 ## 多執行緒注意事項
 
