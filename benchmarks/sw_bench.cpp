@@ -43,7 +43,7 @@ const char* usage =
     "Usage: sw-bench --reference R.fa --query Q.fa [options]\n"
     "  --backend striped|scalar|cuda   (default striped)\n"
     "  --threads N                     CPU worker threads (default 1)\n"
-    "  --regs N                        cuda columns per lane: 1,2,4,8,16 (default 8)\n"
+    "  --regs N                        cuda columns per lane: 1,2,4,8,16 (default: by query length)\n"
     "  --pairing zip|all_vs_all        (default zip)\n"
     "  --scoring M,X,O,E               match,mismatch,gap_open,gap_extend (default 1,-4,-6,-1)\n"
     "  --score-only                    request score-only results (no traceback)\n"

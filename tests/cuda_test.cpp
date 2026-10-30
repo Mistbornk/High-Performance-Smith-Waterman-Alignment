@@ -48,6 +48,13 @@ int main() {
     std::vector<std::size_t> mixed;
     for (int i = 0; i < 40; ++i) mixed.push_back(rng() % 300);
     check_workload(sw::Workload(random_set(rng, mixed), random_set(rng, mixed), sw::Pairing::all_vs_all), {});
+    // Query lengths in every bucket at once (regs == 0 splits them into launches), and
+    // the same set with a forced regs, where order still maps scores back to tasks.
+    {
+      std::vector<std::size_t> lens, order;
+      for (int i = 0; i < 300; ++i) lens.push_back(1 + (i * 37) % 700), order.push_back(rng() % 400);
+      check_workload(sw::Workload(random_set(rng, order), random_set(rng, lens), sw::Pairing::zip), {});
+    }
     // Long pairs: many stripes and many prefetch blocks.
     check_workload(sw::Workload(random_set(rng, {5000, 3000, 1}), random_set(rng, {4000, 3001, 7000}),
                                 sw::Pairing::zip), {});

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Ported from the earlier Biovoltron SmithWatermanCuda kernel, changed to global
@@ -15,6 +16,16 @@ constexpr int warp_size = 32;
 constexpr int warps_per_block = 8;
 constexpr unsigned full_mask = 0xffffffffu;
 constexpr int neg_inf = INT_MIN / 2;
+
+// A stripe is 32 * R query columns wide, so a short query leaves lanes idle when R is
+// large. With regs == 0, tasks are grouped by query length and each group runs with its
+// own R: the first bucket whose max_query >= m.
+struct Bucket {
+  std::size_t max_query;
+  int regs;
+};
+constexpr Bucket buckets[] = {{64, 2}, {1024, 8}, {SIZE_MAX, 16}};
+constexpr std::size_t bucket_count = sizeof(buckets) / sizeof(buckets[0]);
 
 void check(cudaError_t e, const char* what) {
   if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
@@ -135,18 +146,19 @@ __device__ int warp_score(const Base* __restrict__ ref, const Base* __restrict__
   return __shfl_sync(full_mask, result, ((m - 1) % stripe) / R);
 }
 
-// Grid-stride over tasks, one warp per task; each warp slot owns 2 * temp_rows ints
-// of edge scratch, reused for every task it processes.
+// Grid-stride over order[0..count), one warp per task; each warp slot owns 2 * temp_rows
+// ints of edge scratch, reused for every task it processes. order holds task numbers.
 template <int R>
-__global__ void score_kernel(DeviceSet refs, DeviceSet queries, std::size_t tasks,
-                             std::size_t reference_count, bool zip, Scoring p,
+__global__ void score_kernel(DeviceSet refs, DeviceSet queries, const std::size_t* order,
+                             std::size_t count, std::size_t reference_count, bool zip, Scoring p,
                              int* temp, std::size_t temp_rows, int* scores) {
   const std::size_t thread = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x;
   const std::size_t warp = thread / warp_size;
   const std::size_t warps = gridDim.x * std::size_t(blockDim.x) / warp_size;
   int* temp_h = temp + warp * 2 * temp_rows;
   int* temp_f = temp_h + temp_rows;
-  for (std::size_t t = warp; t < tasks; t += warps) {
+  for (std::size_t i = warp; i < count; i += warps) {
+    const std::size_t t = order[i];
     // Same mapping as Workload::task().
     const std::size_t r = zip ? t : t % reference_count, q = zip ? t : t / reference_count;
     const int n = int(refs.offsets[r + 1] - refs.offsets[r]);
@@ -184,6 +196,8 @@ struct Batch::Impl {
   DeviceBuffer<Base> ref_data, query_data;
   DeviceBuffer<std::size_t> ref_offsets, query_offsets;
   DeviceBuffer<int> temp, scores;
+  DeviceBuffer<std::size_t> order;          // Task numbers: grouped by bucket, heaviest first.
+  std::size_t bucket_begin[bucket_count + 1] = {};  // Bucket b is order[bucket_begin[b], bucket_begin[b+1]).
   std::size_t tasks = 0, reference_count = 0, max_ref = 0, max_query = 0;
   bool zip = true;
 };
@@ -206,6 +220,24 @@ Batch::Batch(const Workload& workload) : impl_(new Impl) {
   d.query_data.upload(queries.data(), queries.total_bases());
   d.query_offsets.upload(queries.offsets().data(), queries.offsets().size());
   d.scores.resize(d.tasks);
+
+  // Group tasks by query length, and inside a group put the largest ones first so the
+  // grid-stride loop ends with small tasks and the warps finish together.
+  std::vector<std::size_t> order(d.tasks), cells(d.tasks), bucket(d.tasks);
+  for (std::size_t t = 0; t < d.tasks; ++t) {
+    const auto [r, q] = d.zip ? std::pair{t, t} : std::pair{t % d.reference_count, t / d.reference_count};
+    const std::size_t n = refs.offsets()[r + 1] - refs.offsets()[r];
+    const std::size_t m = queries.offsets()[q + 1] - queries.offsets()[q];
+    std::size_t b = 0;
+    while (m > buckets[b].max_query) ++b;
+    order[t] = t, cells[t] = n * m, bucket[t] = b;
+    ++d.bucket_begin[b + 1];
+  }
+  for (std::size_t b = 0; b < bucket_count; ++b) d.bucket_begin[b + 1] += d.bucket_begin[b];
+  std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    return bucket[a] != bucket[b] ? bucket[a] < bucket[b] : cells[a] != cells[b] ? cells[a] > cells[b] : a < b;
+  });
+  d.order.upload(order.data(), order.size());
 }
 
 Batch::~Batch() = default;
@@ -223,27 +255,47 @@ void Batch::score(Scoring p, std::vector<std::int32_t>& out, int regs) {
   out.resize(d.tasks);
   if (!d.tasks) return;
 
-  // As many concurrent warps as the edge-scratch budget allows.
+  if (regs != 0 && regs != 1 && regs != 2 && regs != 4 && regs != 8 && regs != 16)
+    throw std::invalid_argument("regs must be 0, 1, 2, 4, 8 or 16");
+
+  // A fixed regs runs everything in one launch; 0 runs one launch per length bucket.
+  struct Launch {
+    std::size_t first, count;
+    int regs;
+  };
+  std::vector<Launch> launches;
+  if (regs) launches.push_back({0, d.tasks, regs});
+  else
+    for (std::size_t b = 0; b < bucket_count; ++b)
+      if (const auto count = d.bucket_begin[b + 1] - d.bucket_begin[b])
+        launches.push_back({d.bucket_begin[b], count, buckets[b].regs});
+
+  // As many concurrent warps as the edge-scratch budget allows; the launches share it.
   constexpr std::size_t budget = std::size_t(256) << 20;
   const std::size_t rows = std::max<std::size_t>(1, d.max_ref);
   const auto fit = std::max<std::size_t>(1, budget / (2 * rows * sizeof(int)));
-  const auto blocks = (std::min(d.tasks, fit) + warps_per_block - 1) / warps_per_block;
-  d.temp.resize(blocks * warps_per_block * 2 * rows);
-
-  if (regs == 0) regs = 8;  // Best or tied-best on 150 bp, 512 bp and mixed-length data.
-  auto launch = [&](auto kernel) {
-    kernel<<<unsigned(blocks), warps_per_block * warp_size>>>(
-        DeviceSet{d.ref_data.data(), d.ref_offsets.data()},
-        DeviceSet{d.query_data.data(), d.query_offsets.data()},
-        d.tasks, d.reference_count, d.zip, p, d.temp.data(), rows, d.scores.data());
+  auto blocks_for = [&](std::size_t count) {
+    return (std::min(count, fit) + warps_per_block - 1) / warps_per_block;
   };
-  switch (regs) {
-    case 1: launch(score_kernel<1>); break;
-    case 2: launch(score_kernel<2>); break;
-    case 4: launch(score_kernel<4>); break;
-    case 8: launch(score_kernel<8>); break;
-    case 16: launch(score_kernel<16>); break;
-    default: throw std::invalid_argument("regs must be 0, 1, 2, 4, 8 or 16");
+  std::size_t max_blocks = 0;
+  for (const auto& l : launches) max_blocks = std::max(max_blocks, blocks_for(l.count));
+  d.temp.resize(max_blocks * warps_per_block * 2 * rows);
+
+  for (const auto& l : launches) {
+    auto launch = [&](auto kernel) {
+      kernel<<<unsigned(blocks_for(l.count)), warps_per_block * warp_size>>>(
+          DeviceSet{d.ref_data.data(), d.ref_offsets.data()},
+          DeviceSet{d.query_data.data(), d.query_offsets.data()},
+          d.order.data() + l.first, l.count, d.reference_count, d.zip, p, d.temp.data(), rows,
+          d.scores.data());
+    };
+    switch (l.regs) {
+      case 1: launch(score_kernel<1>); break;
+      case 2: launch(score_kernel<2>); break;
+      case 4: launch(score_kernel<4>); break;
+      case 8: launch(score_kernel<8>); break;
+      default: launch(score_kernel<16>); break;
+    }
   }
   check(cudaGetLastError(), "score_kernel launch");
   check(cudaMemcpy(out.data(), d.scores.data(), d.tasks * sizeof(int), cudaMemcpyDeviceToHost),
