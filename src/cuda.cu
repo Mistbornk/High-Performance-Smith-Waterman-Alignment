@@ -1,7 +1,6 @@
 #include <sw/io.hpp>
 #include <cuda_runtime.h>
 #include <algorithm>
-#include <climits>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -12,10 +11,9 @@
 // alignment and score-only: no trace matrix, no gap-length tracking, no sink search.
 namespace sw::cuda {
 namespace {
-constexpr int warp_size = 32;
-constexpr int warps_per_block = 8;
-constexpr unsigned full_mask = 0xffffffffu;
-constexpr int neg_inf = INT_MIN / 2;
+constexpr int warp_size = 32;                // One warp scores one pair.
+constexpr int warps_per_block = 8;           // 256 threads per block.
+constexpr unsigned full_mask = 0xffffffffu;  // Every lane takes part in each shuffle.
 
 // A stripe is 32 * R query columns wide, so a short query leaves lanes idle when R is
 // large. With regs == 0, tasks are grouped by query length and each group runs with its
@@ -57,97 +55,145 @@ template <class T> class DeviceBuffer {
   std::size_t capacity_ = 0;
 };
 
+// Device view of a SequenceSet: sequence i is data[offsets[i] .. offsets[i + 1]).
 struct DeviceSet {
   const Base* data;
   const std::size_t* offsets;
 };
 
+// Score of a gap of length k: open + (k - 1) * extend, and 0 for k = 0. Gives the borders
+// S(i,0) = gap(i) and S(0,j) = gap(j), and turns the summed differences back into S(n,m).
 __device__ __forceinline__ int gap(int k, Scoring p) {
   return k ? p.gap_open + (k - 1) * p.gap_extend : 0;
 }
 
 // One warp scores one pair: reference rows 1..n, query columns 1..m. The query is cut
-// into stripes of 32 * R columns; lane l owns R consecutive columns of a stripe and keeps
-// their H and vertical-gap E in registers. Lanes sweep anti-diagonals (lane l handles row
-// d - l - 1 at step d). Only the border between two lanes travels through shuffles: H and
-// the horizontal gap F of a lane's last column, plus the reference character. The
-// stripe's last column is stored in temp_h/temp_f (one entry per reference row) and
-// becomes the next stripe's left edge.
+// into stripes of 32 * R columns; lane l owns R consecutive columns of a stripe. Lanes
+// sweep anti-diagonals (lane l handles row d - l - 1 at step d). The stripe's last column
+// is stored in temp_v/temp_f (one entry per reference row) and becomes the next stripe's
+// left edge.
 //
-//   E(i,j) = max(H(i-1,j) + open, E(i-1,j) + extend)   vertical, from up = h[k]
-//   F(i,j) = max(H(i,j-1) + open, F(i,j-1) + extend)   horizontal, from left_h / left_f
-//   H(i,j) = max(H(i-1,j-1) + sub, E(i,j), F(i,j))
-// with H(i,0) = gap(i), H(0,j) = gap(j), E(0,j) = F(i,0) = -inf: the same DP as
-// sw::scalar, so scores match it exactly.
+// Parameters:
+//   R               columns per lane; wider stripes mean fewer shuffles per cell
+//   ref, query      encoded bases (0..4) of the pair, n and m long, both >= 1
+//   p               match / mismatch / gap_open (a 1-long gap) / gap_extend (each further
+//                   gap base); requires gap_open <= gap_extend <= 0
+//   temp_v, temp_f  this warp's edge scratch, n ints each
+//
+// Difference recurrence (Suzuki-Kasahara), with the letters of the striped backend: S is
+// the absolute score and
+//   H(i,j) = S(i,j) - S(i,j-1)      horizontal difference
+//   v(i,j) = S(i,j) - S(i-1,j)      vertical difference
+//   e(i,j) = E(i,j) - S(i-1,j-1)    vertical gap candidate, measured from the diagonal cell
+//   f(i,j) = F(i,j) - S(i-1,j-1)    horizontal gap candidate, measured from the diagonal cell
+//   A(i,j) = S(i,j) - S(i-1,j-1)
+// stay within a few times the largest |scoring value| however long the sequences are.
+//   h[k]    = H(i-1,j)   one per column, from the previous row         (striped H[j])
+//   e[k]    = e(i,j)     one per column                                (striped E[j])
+//   v_left  = v(i,j-1)   vertical difference, carried along a row      (striped v)
+//   f_left  = f(i,j)     horizontal gap candidate, carried along a row (striped f)
+// The recurrence of sw::scalar becomes
+//   A        = max(sub, e(i,j), f(i,j))
+//   v(i,j)   = A - H(i-1,j)                H(i,j) = A - v(i,j-1)
+//   e(i+1,j) = max(A + open, e(i,j) + extend) - v(i,j-1)
+//   f(i,j+1) = max(A + open, f(i,j) + extend) - H(i-1,j)
+// and its boundaries S(i,0) = gap(i), S(0,j) = gap(j), E(0,j) = F(i,0) = -inf become
+//   H(0,j) = v(i,0) = open for the first cell and extend after it;
+//   e(1,j) = H(0,j) + open;  f(i,1) = v(i,0) + open.
+// The score is S(n,m) = gap(m) + sum of v(i,m) over all rows, summed by the lane that owns
+// column m.
 template <int R>
 __device__ int warp_score(const Base* __restrict__ ref, const Base* __restrict__ query, int n, int m,
-                          Scoring p, int* __restrict__ temp_h, int* __restrict__ temp_f) {
-  constexpr int stripe = warp_size * R;
-  const int lane = threadIdx.x & (warp_size - 1);
-  // The first stripe's left edge is column 0.
-  for (int row = lane; row < n; row += warp_size) temp_h[row] = gap(row + 1, p), temp_f[row] = neg_inf;
+                          Scoring p, int* __restrict__ temp_v, int* __restrict__ temp_f) {
+  constexpr int stripe = warp_size * R;  // Query columns covered by one pass of the warp.
+  const int lane = threadIdx.x & (warp_size - 1);  // 0..31, position inside the warp.
+  // The first stripe's left edge is column 0: v(i,0) is open for the first row and extend
+  // after it, and f(i,1) = v(i,0) + open.
+  for (int row = lane; row < n; row += warp_size) {  // row is 0-based: reference row i = row + 1.
+    const int v0 = row ? p.gap_extend : p.gap_open;
+    temp_v[row] = v0;
+    temp_f[row] = v0 + p.gap_open;
+  }
+
   __syncwarp();
 
-  int result = 0;
-  for (int block = 0; block < m; block += stripe) {
+  int result = 0;  // Sum of v(i,m) over the rows; only the lane that owns column m adds to it.
+  for (int block = 0; block < m; block += stripe) {  // block: columns done in earlier stripes.
     const int lanes = min(warp_size, (m - block + R - 1) / R); // Lanes owning a column <= m.
-    const int col0 = block + lane * R + 1;
-    int q[R], h[R], e[R];
+    const int col0 = block + lane * R + 1;  // My first query column (1-based).
+    int q[R], h[R], e[R];  // Per owned column: query base, H(i-1,col), e(i,col).
 #pragma unroll
     for (int k = 0; k < R; ++k) {
       const int col = col0 + k;
-      q[k] = col <= m ? query[col-1] : -1;
-      h[k] = gap(col, p);
-      e[k] = neg_inf;
+      q[k] = col <= m ? query[col-1] : -1;                 // Columns past m never match.
+      h[k] = col == 1 ? p.gap_open : p.gap_extend;         // H(0, col)
+      e[k] = h[k] + p.gap_open;                            // e(1, col) = H(0, col) + open
     }
-    // H(0, col0 - 1)
-    int h_diag = gap(col0 - 1, p);
-    // Lane 0 takes these from the cache.
-    int h_left = 0, f_left = neg_inf, r = 0;
-    // last column, handed to lane + 1.
-    int h_out = 0, f_out = neg_inf;
-    int cache_h = 0, cache_f = neg_inf, cache_r = 0;
+    // From the lane on the left (lane 0 takes them from the cache): v(i, col0-1), f(i, col0)
+    // and the reference base r of row i.
+    int v_left = 0, f_left = 0, r = 0;
+    // My last column's v and f, handed to lane + 1.
+    int v_out = 0, f_out = 0;
+    int cache_v = 0, cache_f = 0, cache_r = 0;  // Left-edge rows prefetched for 32 steps.
 
+    // base is the first step of a 32-step block; step d puts lane l on row d - l - 1.
     for (int base = 2; base <= lanes + n; base += warp_size) {
       // Every 32 steps each lane prefetches one left-edge row; the values then shift
       // down one lane per step, so lane 0 always holds the row it needs next.
       const int row = base - 2 + lane;
-      if (row < n) cache_h = temp_h[row], cache_f = temp_f[row], cache_r = ref[row];
-      else cache_h = 0, cache_f = neg_inf, cache_r = 0;
+      if (row < n) cache_v = temp_v[row], cache_f = temp_f[row], cache_r = ref[row];
+      else cache_v = 0, cache_f = 0, cache_r = 0;
 
       for (int d = base; d < base + warp_size; ++d) {
         const int i = d - lane - 1;  // Reference row of this lane at step d.
         if (lane < lanes && i >= 1 && i <= n) {
-          if (lane == 0) r = cache_r, h_left = cache_h, f_left = cache_f;
-          int diag = h_diag, left_h = h_left, left_f = f_left;
+          if (lane == 0) r = cache_r, v_left = cache_v, f_left = cache_f;
+          // v(i, col-1) and f(i, col): start from the left neighbour's values and are
+          // updated in place while walking over my R columns from left to right.
+          int v = v_left, f = f_left;
 #pragma unroll
           for (int k = 0; k < R; ++k) {
-            const int up = h[k];
-            e[k] = max(up + p.gap_open, e[k] + p.gap_extend);
-            const int f = max(left_h + p.gap_open, left_f + p.gap_extend);
-            const int v = max(max(diag + (r == q[k] ? p.match : p.mismatch), e[k]), f);
-            if (col0 + k == m && i == n) result = v;
-            diag = up, h[k] = v, left_h = v, left_f = f;
+            // A = S(i,j) - S(i-1,j-1): best of the diagonal (sub), the vertical gap e and
+            // the horizontal gap f. All three are measured from the diagonal cell.
+            const int A = max(max(r == q[k] ? p.match : p.mismatch, e[k]), f);
+            const int vij = A - h[k];  // v(i,j) = A - H(i-1,j)
+            const int hij = A - v;     // H(i,j) = A - v(i,j-1)
+            if (col0 + k == m) result += vij;  // Column m: sum of v(i,m) gives S(n,m) - S(0,m).
+            // Gap candidates for the next row (e) and the next column (f); each subtracts
+            // the difference that shifts its reference cell to the new diagonal cell.
+            const int eij = max(A + p.gap_open, e[k] + p.gap_extend) - v;     // e(i+1,j)
+            const int fij = max(A + p.gap_open, f + p.gap_extend) - h[k];     // f(i,j+1)
+            // Write back only now: all four values above use the old h[k], e[k], v and f.
+            h[k] = hij, e[k] = eij, v = vij, f = fij;
           }
-          if (lane == warp_size - 1) temp_h[i - 1] = left_h, temp_f[i - 1] = left_f;
-          h_diag = h_left;
-          h_out = left_h, f_out = left_f;
+          // The last lane saves its last column as the next stripe's left edge.
+          if (lane == warp_size - 1) temp_v[i - 1] = v, temp_f[i - 1] = f;
+          v_out = v, f_out = f;
         }
+        // Hand my last column (and the reference base) to the lane on the right ...
         r = __shfl_up_sync(full_mask, r, 1);
-        h_left = __shfl_up_sync(full_mask, h_out, 1);
+        v_left = __shfl_up_sync(full_mask, v_out, 1);
         f_left = __shfl_up_sync(full_mask, f_out, 1);
-        cache_h = __shfl_down_sync(full_mask, cache_h, 1);
+        // ... and move the prefetched left-edge rows one lane down.
+        cache_v = __shfl_down_sync(full_mask, cache_v, 1);
         cache_f = __shfl_down_sync(full_mask, cache_f, 1);
         cache_r = __shfl_down_sync(full_mask, cache_r, 1);
       }
     }
     __syncwarp();  // The next stripe reads the edge lane 31 just wrote.
   }
-  return __shfl_sync(full_mask, result, ((m - 1) % stripe) / R);
+  // S(n,m) = gap(m) + sum of v(i,m); the lane that owned column m in the last stripe has the sum.
+  return gap(m, p) + __shfl_sync(full_mask, result, ((m - 1) % stripe) / R);
 }
 
 // Grid-stride over order[0..count), one warp per task; each warp slot owns 2 * temp_rows
 // ints of edge scratch, reused for every task it processes. order holds task numbers.
+//   refs, queries     device copies of the two sequence sets
+//   reference_count   number of references; with all-vs-all it maps a task number to its pair
+//   zip               true: task t is (reference t, query t); false: all-vs-all, query-major
+//   p                 scoring
+//   temp, temp_rows   edge scratch for every warp slot, temp_rows >= the longest reference
+//   scores            output, scores[t] is the score of task t
 template <int R>
 __global__ void score_kernel(DeviceSet refs, DeviceSet queries, const std::size_t* order,
                              std::size_t count, std::size_t reference_count, bool zip, Scoring p,
@@ -155,8 +201,8 @@ __global__ void score_kernel(DeviceSet refs, DeviceSet queries, const std::size_
   const std::size_t thread = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x;
   const std::size_t warp = thread / warp_size;
   const std::size_t warps = gridDim.x * std::size_t(blockDim.x) / warp_size;
-  int* temp_h = temp + warp * 2 * temp_rows;
-  int* temp_f = temp_h + temp_rows;
+  int* temp_v = temp + warp * 2 * temp_rows;
+  int* temp_f = temp_v + temp_rows;
   for (std::size_t i = warp; i < count; i += warps) {
     const std::size_t t = order[i];
     // Same mapping as Workload::task().
@@ -165,7 +211,7 @@ __global__ void score_kernel(DeviceSet refs, DeviceSet queries, const std::size_
     const int m = int(queries.offsets[q + 1] - queries.offsets[q]);
     const int s = !n || !m ? gap(n + m, p)
                            : warp_score<R>(refs.data + refs.offsets[r], queries.data + queries.offsets[q],
-                                        n, m, p, temp_h, temp_f);
+                                        n, m, p, temp_v, temp_f);
     if ((threadIdx.x & (warp_size - 1)) == 0) scores[t] = s;
   }
 }
