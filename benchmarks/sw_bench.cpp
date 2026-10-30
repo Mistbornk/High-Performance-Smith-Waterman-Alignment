@@ -32,6 +32,7 @@ struct Args {
   sw::Pairing pairing = sw::Pairing::zip;
   sw::Scoring scoring;
   unsigned threads = 1;
+  unsigned regs = 0;
   bool traceback = true;
   sw::io::ReadOptions read;
   unsigned warmup = 1, repetitions = 5;
@@ -42,6 +43,7 @@ const char* usage =
     "Usage: sw-bench --reference R.fa --query Q.fa [options]\n"
     "  --backend striped|scalar|cuda   (default striped)\n"
     "  --threads N                     CPU worker threads (default 1)\n"
+    "  --regs N                        cuda columns per lane: 1,2,4,8,16 (default 8)\n"
     "  --pairing zip|all_vs_all        (default zip)\n"
     "  --scoring M,X,O,E               match,mismatch,gap_open,gap_extend (default 1,-4,-6,-1)\n"
     "  --score-only                    request score-only results (no traceback)\n"
@@ -99,6 +101,7 @@ Args parse(int argc, char** argv) {
     else if (key == "--label") args.label = value;
     else if (key == "--scoring") args.scoring = parse_scoring(value);
     else if (key == "--threads") args.threads = parse_unsigned(value, key);
+    else if (key == "--regs") args.regs = parse_unsigned(value, key);
     else if (key == "--warmup") args.warmup = parse_unsigned(value, key);
     else if (key == "--repetitions") args.repetitions = parse_unsigned(value, key);
     else throw std::invalid_argument("unknown option " + key);
@@ -197,7 +200,7 @@ int main(int argc, char** argv) {
     auto align_all = [&] {
 #if SW_HAVE_CUDA
       if (device) {
-        batch->score(args.scoring, scores);
+        batch->score(args.scoring, scores, int(args.regs));
         for (std::size_t i = 0; i < scores.size(); ++i) results[i].score = scores[i];
         return;
       }

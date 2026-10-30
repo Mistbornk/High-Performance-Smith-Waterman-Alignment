@@ -56,35 +56,48 @@ __device__ __forceinline__ int gap(int k, Scoring p) {
 }
 
 // One warp scores one pair: reference rows 1..n, query columns 1..m. The query is cut
-// into 32-column stripes with one column per lane. Inside a stripe the lanes sweep
-// anti-diagonals (lane l handles row d - l - 1 at step d); H and the horizontal gap F
-// move right through shuffles. The stripe's last column is stored in temp_h/temp_f
-// (one entry per reference row) and becomes the next stripe's left edge.
+// into stripes of 32 * R columns; lane l owns R consecutive columns of a stripe and keeps
+// their H and vertical-gap E in registers. Lanes sweep anti-diagonals (lane l handles row
+// d - l - 1 at step d). Only the border between two lanes travels through shuffles: H and
+// the horizontal gap F of a lane's last column, plus the reference character. The
+// stripe's last column is stored in temp_h/temp_f (one entry per reference row) and
+// becomes the next stripe's left edge.
 //
-//   E(i,j) = max(H(i-1,j) + open, E(i-1,j) + extend)   vertical, from h_top
-//   F(i,j) = max(H(i,j-1) + open, F(i,j-1) + extend)   horizontal, from h_left
+//   E(i,j) = max(H(i-1,j) + open, E(i-1,j) + extend)   vertical, from up = h[k]
+//   F(i,j) = max(H(i,j-1) + open, F(i,j-1) + extend)   horizontal, from left_h / left_f
 //   H(i,j) = max(H(i-1,j-1) + sub, E(i,j), F(i,j))
 // with H(i,0) = gap(i), H(0,j) = gap(j), E(0,j) = F(i,0) = -inf: the same DP as
 // sw::scalar, so scores match it exactly.
+template <int R>
 __device__ int warp_score(const Base* __restrict__ ref, const Base* __restrict__ query, int n, int m,
                           Scoring p, int* __restrict__ temp_h, int* __restrict__ temp_f) {
+  constexpr int stripe = warp_size * R;
   const int lane = threadIdx.x & (warp_size - 1);
   // The first stripe's left edge is column 0.
   for (int row = lane; row < n; row += warp_size) temp_h[row] = gap(row + 1, p), temp_f[row] = neg_inf;
   __syncwarp();
 
   int result = 0;
-  for (int block = 0; block < m; block += warp_size) {
-    const int width = min(warp_size, m - block);
-    const int col = block + lane + 1;
-    const int q = col <= m ? query[col - 1] : -1;
-    // Row 0 of this column; the first diagonal predecessor is H(0, col-1).
-    int h_top = gap(col, p), h_diag = gap(col - 1, p), e_top = neg_inf;
-    int h_left = 0, f_left = neg_inf, r = 0;  // Lane 0 takes these from the cache.
-    int h_val = 0, f_val = neg_inf;
+  for (int block = 0; block < m; block += stripe) {
+    const int lanes = min(warp_size, (m - block + R - 1) / R); // Lanes owning a column <= m.
+    const int col0 = block + lane * R + 1;
+    int q[R], h[R], e[R];
+#pragma unroll
+    for (int k = 0; k < R; ++k) {
+      const int col = col0 + k;
+      q[k] = col <= m ? query[col-1] : -1;
+      h[k] = gap(col, p);
+      e[k] = neg_inf;
+    }
+    // H(0, col0 - 1)
+    int h_diag = gap(col0 - 1, p);
+    // Lane 0 takes these from the cache.
+    int h_left = 0, f_left = neg_inf, r = 0;
+    // last column, handed to lane + 1.
+    int h_out = 0, f_out = neg_inf;
     int cache_h = 0, cache_f = neg_inf, cache_r = 0;
 
-    for (int base = 2; base <= width + n; base += warp_size) {
+    for (int base = 2; base <= lanes + n; base += warp_size) {
       // Every 32 steps each lane prefetches one left-edge row; the values then shift
       // down one lane per step, so lane 0 always holds the row it needs next.
       const int row = base - 2 + lane;
@@ -93,20 +106,25 @@ __device__ int warp_score(const Base* __restrict__ ref, const Base* __restrict__
 
       for (int d = base; d < base + warp_size; ++d) {
         const int i = d - lane - 1;  // Reference row of this lane at step d.
-        if (lane < width && i >= 1 && i <= n) {
+        if (lane < lanes && i >= 1 && i <= n) {
           if (lane == 0) r = cache_r, h_left = cache_h, f_left = cache_f;
-          const int e = max(h_top + p.gap_open, e_top + p.gap_extend);
-          f_val = max(h_left + p.gap_open, f_left + p.gap_extend);
-          h_val = max(max(h_diag + (r == q ? p.match : p.mismatch), e), f_val);
-          if (lane == warp_size - 1) temp_h[i - 1] = h_val, temp_f[i - 1] = f_val;
-          if (col == m && i == n) result = h_val;
+          int diag = h_diag, left_h = h_left, left_f = f_left;
+#pragma unroll
+          for (int k = 0; k < R; ++k) {
+            const int up = h[k];
+            e[k] = max(up + p.gap_open, e[k] + p.gap_extend);
+            const int f = max(left_h + p.gap_open, left_f + p.gap_extend);
+            const int v = max(max(diag + (r == q[k] ? p.match : p.mismatch), e[k]), f);
+            if (col0 + k == m && i == n) result = v;
+            diag = up, h[k] = v, left_h = v, left_f = f;
+          }
+          if (lane == warp_size - 1) temp_h[i - 1] = left_h, temp_f[i - 1] = left_f;
           h_diag = h_left;
-          h_top = h_val;
-          e_top = e;
+          h_out = left_h, f_out = left_f;
         }
         r = __shfl_up_sync(full_mask, r, 1);
-        h_left = __shfl_up_sync(full_mask, h_val, 1);
-        f_left = __shfl_up_sync(full_mask, f_val, 1);
+        h_left = __shfl_up_sync(full_mask, h_out, 1);
+        f_left = __shfl_up_sync(full_mask, f_out, 1);
         cache_h = __shfl_down_sync(full_mask, cache_h, 1);
         cache_f = __shfl_down_sync(full_mask, cache_f, 1);
         cache_r = __shfl_down_sync(full_mask, cache_r, 1);
@@ -114,11 +132,12 @@ __device__ int warp_score(const Base* __restrict__ ref, const Base* __restrict__
     }
     __syncwarp();  // The next stripe reads the edge lane 31 just wrote.
   }
-  return __shfl_sync(full_mask, result, (m - 1) % warp_size);
+  return __shfl_sync(full_mask, result, ((m - 1) % stripe) / R);
 }
 
 // Grid-stride over tasks, one warp per task; each warp slot owns 2 * temp_rows ints
 // of edge scratch, reused for every task it processes.
+template <int R>
 __global__ void score_kernel(DeviceSet refs, DeviceSet queries, std::size_t tasks,
                              std::size_t reference_count, bool zip, Scoring p,
                              int* temp, std::size_t temp_rows, int* scores) {
@@ -133,7 +152,7 @@ __global__ void score_kernel(DeviceSet refs, DeviceSet queries, std::size_t task
     const int n = int(refs.offsets[r + 1] - refs.offsets[r]);
     const int m = int(queries.offsets[q + 1] - queries.offsets[q]);
     const int s = !n || !m ? gap(n + m, p)
-                           : warp_score(refs.data + refs.offsets[r], queries.data + queries.offsets[q],
+                           : warp_score<R>(refs.data + refs.offsets[r], queries.data + queries.offsets[q],
                                         n, m, p, temp_h, temp_f);
     if ((threadIdx.x & (warp_size - 1)) == 0) scores[t] = s;
   }
@@ -191,7 +210,7 @@ Batch::Batch(const Workload& workload) : impl_(new Impl) {
 
 Batch::~Batch() = default;
 
-void Batch::score(Scoring p, std::vector<std::int32_t>& out) {
+void Batch::score(Scoring p, std::vector<std::int32_t>& out, int regs) {
   auto& d = *impl_;
   if (p.gap_extend > 0 || p.gap_open > p.gap_extend)
     throw std::invalid_argument("Requires gap_open<=gap_extend<=0");
@@ -211,9 +230,21 @@ void Batch::score(Scoring p, std::vector<std::int32_t>& out) {
   const auto blocks = (std::min(d.tasks, fit) + warps_per_block - 1) / warps_per_block;
   d.temp.resize(blocks * warps_per_block * 2 * rows);
 
-  score_kernel<<<unsigned(blocks), warps_per_block * warp_size>>>(
-      {d.ref_data.data(), d.ref_offsets.data()}, {d.query_data.data(), d.query_offsets.data()},
-      d.tasks, d.reference_count, d.zip, p, d.temp.data(), rows, d.scores.data());
+  if (regs == 0) regs = 8;  // Best or tied-best on 150 bp, 512 bp and mixed-length data.
+  auto launch = [&](auto kernel) {
+    kernel<<<unsigned(blocks), warps_per_block * warp_size>>>(
+        DeviceSet{d.ref_data.data(), d.ref_offsets.data()},
+        DeviceSet{d.query_data.data(), d.query_offsets.data()},
+        d.tasks, d.reference_count, d.zip, p, d.temp.data(), rows, d.scores.data());
+  };
+  switch (regs) {
+    case 1: launch(score_kernel<1>); break;
+    case 2: launch(score_kernel<2>); break;
+    case 4: launch(score_kernel<4>); break;
+    case 8: launch(score_kernel<8>); break;
+    case 16: launch(score_kernel<16>); break;
+    default: throw std::invalid_argument("regs must be 0, 1, 2, 4, 8 or 16");
+  }
   check(cudaGetLastError(), "score_kernel launch");
   check(cudaMemcpy(out.data(), d.scores.data(), d.tasks * sizeof(int), cudaMemcpyDeviceToHost),
         "score_kernel");

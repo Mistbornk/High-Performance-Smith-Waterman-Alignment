@@ -68,4 +68,11 @@ python3 scripts/run_benchmarks.py --bench build/sw-bench --dataset data/len512 \
   --threads 1,4,16 --out results/run1
 ```
 
+The CUDA backend runs with `--score-only`; `--regs N` (1, 2, 4, 8 or 16, default 8) sets how
+many query columns each lane owns:
+
+```sh
+build/sw-bench --reference R.fa --query Q.fa --backend cuda --score-only --regs 8
+```
+
 See [docs/benchmark.md](docs/benchmark.md) for the IO and timing contract.

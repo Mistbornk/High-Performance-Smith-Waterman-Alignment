@@ -145,8 +145,9 @@ class Batch {
   ~Batch();
   Batch(const Batch&) = delete;
   Batch& operator=(const Batch&) = delete;
-  // Synchronous; out[i] is the global alignment score of workload task i.
-  void score(Scoring scoring, std::vector<std::int32_t>& out);
+  // Synchronous; out[i] is the global alignment score of workload task i. `regs` is the
+  // number of query columns each lane owns (1, 2, 4, 8 or 16); 0 picks the default.
+  void score(Scoring scoring, std::vector<std::int32_t>& out, int regs = 0);
 
  private:
   struct Impl;

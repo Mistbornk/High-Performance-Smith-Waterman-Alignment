@@ -15,12 +15,12 @@ sw::io::SequenceSet random_set(std::mt19937& rng, const std::vector<std::size_t>
   return set;
 }
 
-// Every task's score must equal sw::scalar's, on a fresh and on a reused Batch.
+// Every task's score must equal sw::scalar's, for every register tile width, on one reused Batch.
 void check_workload(const sw::Workload& workload, sw::Scoring p) {
   sw::cuda::Batch batch(workload);
   std::vector<std::int32_t> scores(3);  // Stale content must be replaced.
-  for (int repeat = 0; repeat < 2; ++repeat) {
-    batch.score(p, scores);
+  for (int regs : {0, 1, 2, 4, 8, 16}) {
+    batch.score(p, scores, regs);
     CHECK(scores.size() == workload.size());
     for (std::size_t i = 0; i < workload.size(); ++i)
       CHECK(scores[i] == sw::scalar::score(workload.reference(i), workload.query(i), p));
@@ -35,8 +35,8 @@ int main() {
   }
   try {
     std::mt19937 rng(2026);
-    // Lengths around the 32-column stripe and 32-row prefetch boundaries, plus empties.
-    const std::vector<std::size_t> edges{0, 1, 2, 31, 32, 33, 63, 64, 65, 100, 257};
+    // Lengths around the stripe (32 * regs columns) and 32-row prefetch boundaries, plus empties.
+    const std::vector<std::size_t> edges{0, 1, 2, 31, 32, 33, 63, 64, 65, 100, 257, 511, 512, 513};
     std::vector<std::size_t> refs, queries;
     for (auto n : edges)
       for (auto m : edges) refs.push_back(n), queries.push_back(m);
@@ -63,6 +63,7 @@ int main() {
     std::vector<std::int32_t> scores;
     expect_throw<std::invalid_argument>([&] { batch.score({1, -4, -1, -6}, scores); });
     expect_throw<std::length_error>([&] { batch.score({1, -4, INT32_MIN, -1}, scores); });
+    expect_throw<std::invalid_argument>([&] { batch.score({}, scores, 3); });
     std::cout << "CUDA scores match scalar on zip, all_vs_all, edges and long pairs\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
