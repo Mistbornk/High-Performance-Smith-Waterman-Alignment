@@ -99,6 +99,11 @@ python3 scripts/run_benchmarks.py --bench build/sw-bench \
   與自己配對。空序列的 task 不進 kernel（分數是一個 gap）。
 - `Batch` 建構時上傳 `SequenceSet::data()/offsets()`（`setup_s`）；`score()` 同步回傳。
   邊界 scratch 依 warp slot 配置（256 MB 預算內盡量多開 warp），task 用 grid-stride 分配。
+- 參數（RTX 3090 掃描的結果，`regs` 不指定時生效）：依 query 長度 m 選 R：`m ≤ 64 → 2`、`≤ 128 → 4`、
+  `≤ 1024 → 8`、其餘 `16`；每個 block 4 個 warp（128 threads）。交界點落在 stripe 寬度（`32 * R` 欄），
+  最佳 R 是剛好能用一個 stripe 蓋住 query 的最小值；R=8 與 R=16 在 400–2000 欄之間差距在雜訊內。
+  block 太大反而慢（512 threads 在長序列上慢約 17%），1024 threads 會因暫存器不足而無法啟動。
+  限制 block 數量沒有一致的好處，所以 grid 仍然依工作量決定。
 - sw-bench：沒有 `--score-only` 時回傳 77（skip），`--threads` 必須是 1。
 - 建置：`-DSW_ENABLE_CUDA=ON`，預設 `CMAKE_CUDA_ARCHITECTURES=86`。
 

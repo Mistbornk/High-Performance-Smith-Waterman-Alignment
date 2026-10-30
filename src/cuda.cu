@@ -13,17 +13,19 @@
 namespace sw::cuda {
 namespace {
 constexpr int warp_size = 32;                // One warp scores one pair.
-constexpr int warps_per_block = 8;           // 256 threads per block.
+constexpr int warps_per_block = 4;           // 128 threads per block; swept 64..512, smaller was never slower.
 constexpr unsigned full_mask = 0xffffffffu;  // Every lane takes part in each shuffle.
 
 // A stripe is 32 * R query columns wide, so a short query leaves lanes idle when R is
 // large. With regs == 0, tasks are grouped by query length and each group runs with its
-// own R: the first bucket whose max_query >= m.
+// own R: the first bucket whose max_query >= m. The limits sit at the stripe widths of
+// R = 2 and 4 (64 and 128 columns), where the fastest R changed in a sweep over query lengths
+// 48..8000 on an RTX 3090; R = 8 and 16 were within noise between 400 and 2000 columns.
 struct Bucket {
   std::size_t max_query;
   int regs;
 };
-constexpr Bucket buckets[] = {{64, 2}, {1024, 8}, {SIZE_MAX, 16}};
+constexpr Bucket buckets[] = {{64, 2}, {128, 4}, {1024, 8}, {SIZE_MAX, 16}};
 constexpr std::size_t bucket_count = sizeof(buckets) / sizeof(buckets[0]);
 
 void check(cudaError_t e, const char* what) {
