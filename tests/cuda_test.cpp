@@ -41,7 +41,9 @@ int main() {
     for (auto n : edges)
       for (auto m : edges) refs.push_back(n), queries.push_back(m);
     for (const auto p : {sw::Scoring{}, sw::Scoring{3, -1, -4, -3}, sw::Scoring{2, -3, -5, -2},
-                         sw::Scoring{200, -150, -260, -11}}) {
+                         sw::Scoring{200, -150, -260, -11}, sw::Scoring{2, 0, -3, -3},
+                         sw::Scoring{1, -1, -1, -1}, sw::Scoring{5, -4, -20, 0},
+                         sw::Scoring{1, -4, -680, -680}, sw::Scoring{500, -700, -170, -1}}) {
       check_workload(sw::Workload(random_set(rng, refs), random_set(rng, queries), sw::Pairing::zip), p);
     }
     // all_vs_all mapping, and more tasks than one launch's warps hold edge scratch for.
@@ -71,6 +73,11 @@ int main() {
     expect_throw<std::invalid_argument>([&] { batch.score({1, -4, -1, -6}, scores); });
     expect_throw<std::length_error>([&] { batch.score({1, -4, INT32_MIN, -1}, scores); });
     expect_throw<std::invalid_argument>([&] { batch.score({}, scores, 3); });
+    // Scoring outside the exact range of half precision is rejected, not computed wrongly.
+    expect_throw<std::length_error>([&] { batch.score({1, -4, -683, -683}, scores); });    // 3 * 684 > 2048
+    expect_throw<std::length_error>([&] { batch.score({700, -4, -1, -1}, scores); });      // 3 * 701 > 2048
+    expect_throw<std::length_error>([&] { batch.score({1, -2100, -6, -1}, scores); });     // mismatch below -2048
+    expect_throw<std::length_error>([&] { batch.score({600, -1600, -1, -1}, scores); });  // only match - mismatch > 2048
     std::cout << "CUDA scores match scalar on zip, all_vs_all, edges and long pairs\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

@@ -44,7 +44,7 @@ src/io.cpp             IO and Workload
 src/scalar.cpp         sw::scalar::align / score   (naive Gotoh; the reference)
 src/striped.cpp        sw::striped::align / score  (SSE4.1; only file built with C++20/libsimdpp)
 src/striped/           striped SIMD kernel internals
-src/cuda.cu            sw::cuda::Batch             (one warp per pair; score-only)
+src/cuda.cu            sw::cuda::Batch             (two pairs per warp via half2; score-only)
 benchmarks/sw_bench.cpp  timing driver (one CSV row per run)
 tests/                 align_test (all backends vs. an oracle), io_test, bench_flow_test.py
 ```
